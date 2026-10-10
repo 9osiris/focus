@@ -1,0 +1,6 @@
+{"ts": 1760000000, "role": "user", "text": "how does the retry logic handle a 429 from the embeddings upstream?"}
+{"ts": 1760000060, "role": "assistant", "text": "same as chat: jittered backoff, 3 attempts, then it falls through to the next upstream in the chain. the breaker counts it as a failure."}
+{"ts": 1760000120, "role": "user", "text": "and if all upstreams are down?"}
+{"ts": 1760000180, "role": "assistant", "text": "502 with a json error body. the dashboard shows every upstream red. check relay check output first, it pings each one."}
+{"ts": 1760000240, "role": "user", "text": "remind me what the weight field does again"}
+{"ts": 1760000300, "role": "assistant", "text": "nothing yet. parsed, validated, stored, ignored by routing. that is the open issue."}
