@@ -10,7 +10,7 @@ from .score import Scorer, parse_weights
 from .store import Store
 from .tokens import Tokenizer
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 
 def cmd_build(args):
