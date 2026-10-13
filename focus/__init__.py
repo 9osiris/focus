@@ -6,8 +6,10 @@ from .cli import VERSION, main
 from .render import render, render_trace
 from .score import Scorer, parse_weights
 from .store import Store
+from .tokens import Tokenizer, estimate_tokens
 
 __version__ = VERSION
 __all__ = ["Chunk", "Store", "Scorer", "main", "collect", "chunk_text",
            "chunk_file", "chunk_jsonl", "dedup", "select", "compress_tail",
-           "render", "render_trace", "parse_weights", "__version__"]
+           "render", "render_trace", "parse_weights", "Tokenizer",
+           "estimate_tokens", "__version__"]
