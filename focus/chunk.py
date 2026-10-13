@@ -4,17 +4,14 @@ import os
 import re
 import sys
 
+from .tokens import Tokenizer, estimate_tokens
+
 # words are lowercase alphanumerics, good enough for overlap math
 WORD = re.compile(r"[a-z0-9]+")
 
 
 def words(text):
     return WORD.findall(text.lower())
-
-
-def estimate_tokens(text):
-    # rough 4 chars per token, same rule ctxpack uses
-    return max(1, len(text) // 4)
 
 
 def fingerprint(source, offset, text):
@@ -30,10 +27,12 @@ def fingerprint(source, offset, text):
 class Chunk:
     __slots__ = ("id", "source", "text", "tokens", "mtime", "pinned", "meta")
 
-    def __init__(self, source, text, mtime=0.0, offset=0, pinned=False, meta=None):
+    def __init__(self, source, text, mtime=0.0, offset=0, pinned=False,
+                 meta=None, tokenizer=None):
         self.source = source
         self.text = text
-        self.tokens = estimate_tokens(text)
+        tok = tokenizer if tokenizer is not None else Tokenizer()
+        self.tokens = tok.count(text)
         self.mtime = mtime
         self.pinned = pinned
         self.meta = meta or {}
@@ -46,7 +45,8 @@ class Chunk:
         return "\n".join(lines[:max_lines]) + "\n[...]"
 
 
-def chunk_text(source, text, mtime=0.0, max_lines=40, overlap=8):
+def chunk_text(source, text, mtime=0.0, max_lines=40, overlap=8,
+               tokenizer=None):
     lines = text.splitlines()
     if not lines:
         return []
@@ -56,7 +56,8 @@ def chunk_text(source, text, mtime=0.0, max_lines=40, overlap=8):
         end = min(start + max_lines, len(lines))
         piece = "\n".join(lines[start:end]).strip()
         if piece:
-            chunks.append(Chunk(source, piece, mtime=mtime, offset=start))
+            chunks.append(Chunk(source, piece, mtime=mtime, offset=start,
+                                tokenizer=tokenizer))
         if end == len(lines):
             break
         start = end - overlap
@@ -72,7 +73,7 @@ def looks_binary(path):
     return b"\0" in head
 
 
-def chunk_file(path, max_lines=40, overlap=8):
+def chunk_file(path, max_lines=40, overlap=8, tokenizer=None):
     try:
         st = os.stat(path)
     except OSError:
@@ -85,10 +86,11 @@ def chunk_file(path, max_lines=40, overlap=8):
     except OSError:
         return []
     return chunk_text(path, text, mtime=st.st_mtime,
-                      max_lines=max_lines, overlap=overlap)
+                      max_lines=max_lines, overlap=overlap,
+                      tokenizer=tokenizer)
 
 
-def chunk_jsonl(path, text_field="text"):
+def chunk_jsonl(path, text_field="text", tokenizer=None):
     chunks = []
     try:
         st = os.stat(path)
@@ -118,7 +120,8 @@ def chunk_jsonl(path, text_field="text"):
                 for k in ("ts", "timestamp", "time", "role", "kind"):
                     if k in rec:
                         meta[k] = rec[k]
-            c = Chunk(path, text.strip(), mtime=st.st_mtime, offset=i, meta=meta)
+            c = Chunk(path, text.strip(), mtime=st.st_mtime, offset=i,
+                      meta=meta, tokenizer=tokenizer)
             ts = meta.get("ts") or meta.get("timestamp") or meta.get("time")
             if isinstance(ts, (int, float)):
                 c.mtime = float(ts)
@@ -129,7 +132,7 @@ def chunk_jsonl(path, text_field="text"):
 SKIP_DIRS = {".git", ".hg", ".svn", "__pycache__", "node_modules", ".focus"}
 
 
-def collect(sources, max_lines=40, overlap=8):
+def collect(sources, max_lines=40, overlap=8, tokenizer=None):
     chunks = []
     for src in sources:
         if os.path.isdir(src):
@@ -141,16 +144,19 @@ def collect(sources, max_lines=40, overlap=8):
                         continue
                     path = os.path.join(root, name)
                     if path.endswith(".jsonl"):
-                        chunks.extend(chunk_jsonl(path))
+                        chunks.extend(chunk_jsonl(path,
+                                                  tokenizer=tokenizer))
                     else:
-                        chunks.extend(chunk_file(path, max_lines, overlap))
+                        chunks.extend(chunk_file(path, max_lines, overlap,
+                                                 tokenizer=tokenizer))
         elif os.path.isfile(src):
             if src.endswith(".jsonl"):
-                chunks.extend(chunk_jsonl(src))
+                chunks.extend(chunk_jsonl(src, tokenizer=tokenizer))
             else:
-                chunks.extend(chunk_file(src, max_lines, overlap))
+                chunks.extend(chunk_file(src, max_lines, overlap,
+                                         tokenizer=tokenizer))
         elif src == "-":
             text = sys.stdin.read()
             chunks.extend(chunk_text("stdin", text, max_lines=max_lines,
-                                     overlap=overlap))
+                                     overlap=overlap, tokenizer=tokenizer))
     return chunks
