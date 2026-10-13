@@ -8,14 +8,16 @@ from .chunk import collect
 from .render import render, render_trace
 from .score import Scorer, parse_weights
 from .store import Store
+from .tokens import Tokenizer
 
 VERSION = "1.0.0"
 
 
 def cmd_build(args):
+    tok = Tokenizer(args.tokenizer)
     store = Store()
     chunks = collect(args.sources, max_lines=args.max_lines,
-                     overlap=args.overlap)
+                     overlap=args.overlap, tokenizer=tok)
     if not chunks:
         print("focus: no chunks found in sources", file=sys.stderr)
         return 1
@@ -35,7 +37,7 @@ def cmd_build(args):
 
     kept, dups = dedup(scored)
     selected, excluded = select(kept, args.budget, mmr_lambda=args.mmr)
-    selected, notes = compress_tail(selected, args.budget)
+    selected, notes = compress_tail(selected, args.budget, tokenizer=tok)
 
     out = render(selected)
     if args.out:
@@ -50,6 +52,7 @@ def cmd_build(args):
     if args.trace:
         sel_ids = {c.id for c, _, _, _ in selected}
         all_scored = kept + [(c, s, f) for c, s, f, _ in dups]
+        sys.stderr.write("tokenizer: %s\n" % tok.describe())
         sys.stderr.write("\n" + render_trace(all_scored, sel_ids,
                                              excluded) + "\n")
         for n in notes:
@@ -127,6 +130,11 @@ def build_parser():
                    help="diversity penalty 0-1 (default 0.5)")
     b.add_argument("--max-lines", type=int, default=40)
     b.add_argument("--overlap", type=int, default=8)
+    b.add_argument("--tokenizer", metavar="NAME",
+                   help="tiktoken encoding or model name (e.g. cl100k_base, "
+                        "o200k_base, gpt-4o) for exact token counts; "
+                        "needs tiktoken installed, else warns and uses "
+                        "the 4-char estimate")
     b.set_defaults(func=cmd_build)
 
     i = sub.add_parser("index", help="feed sources into the store")
