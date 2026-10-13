@@ -1,4 +1,5 @@
 from .chunk import words
+from .tokens import Tokenizer
 
 SHINGLE_K = 3
 DEDUP_JACCARD = 0.8
@@ -91,16 +92,19 @@ def select(scored, budget_tokens, mmr_lambda=0.5):
     return selected, excluded
 
 
-def compress_tail(selected, budget_tokens, snippet_lines=3):
+def compress_tail(selected, budget_tokens, tokenizer=None,
+                  snippet_lines=3):
     # if the picks blow the budget, shrink the lowest-scoring non-pinned
     # picks to snippets until it fits. pins are sacred, but if pins alone
     # exceed the budget they get truncated too, last resort, never dropped.
+    # snippet token counts use the same tokenizer as the chunks.
+    tok = tokenizer if tokenizer is not None else Tokenizer()
+
     def shrink(i):
         chunk, score, factors, reason = selected[i]
         short = chunk.snippet(snippet_lines)
-        saved = chunk.tokens - max(1, len(short) // 4)
         chunk.text = short
-        chunk.tokens = max(1, len(short) // 4)
+        chunk.tokens = tok.count(short)
         return "truncated %s to snippet (%d tokens)" % (chunk.id,
                                                          chunk.tokens)
 
