@@ -18,8 +18,8 @@ def render_trace(scored, selected_ids, excluded):
     # scored: list of (chunk, score, factors); a full audit trail of
     # why each candidate made the cut or not.
     lines = []
-    lines.append("id        score   rec    rel    freq   verdict")
-    lines.append("-" * 60)
+    lines.append("id        score   rec    rel    freq   srcw   verdict")
+    lines.append("-" * 66)
     by_id = {c.id: (c, s, f) for c, s, f in scored}
     for chunk, score, factors in sorted(scored, key=lambda s: s[1],
                                         reverse=True):
@@ -27,10 +27,11 @@ def render_trace(scored, selected_ids, excluded):
             verdict = "IN"
         else:
             verdict = "OUT"
-        lines.append("%s  %.3f   %.3f  %.3f  %.3f  %s  %s" %
+        lines.append("%s  %.3f   %.3f  %.3f  %.3f  %.3f  %s  %s" %
                      (chunk.id, score,
                       factors["recency"], factors["relevance"],
-                      factors["frequency"], verdict, chunk.source))
+                      factors["frequency"],
+                      factors.get("source", 1.0), verdict, chunk.source))
     if excluded:
         lines.append("")
         lines.append("excluded:")
