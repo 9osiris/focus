@@ -42,9 +42,11 @@ focus unpin 4bcf07d63984af13
 
 tune it with --weights recency=0.2,relevance=0.5 --half-life 48
 --mmr 0.7. mmr is the diversity penalty, higher means fewer near-dupes
-in the block. budget is a hard cap, tail chunks get truncated to
-snippets before anything gets dropped, pins get truncated last and are
-never dropped.
+in the block. weight whole sources with --source-weight
+chat.jsonl=2.0,notes=0.5, it matches part of the path, first match
+wins, 0 sinks that source to the bottom of the pile. budget is a hard
+cap, tail chunks get truncated to snippets before anything gets
+dropped, pins get truncated last and are never dropped.
 
 token math is 4 chars per token by default, fine for rough budgets but
 it drifts on real prompts. if you have tiktoken installed you can pass
@@ -66,7 +68,9 @@ each chunk gets four factors, weighted and summed. recency decays with
 a 24h half life by default. relevance is idf-weighted query term
 overlap, idf comes from the store once you have indexed anything, else
 from the candidate set. frequency is log-scaled reference count from
-the store. novelty is not a static factor, it is applied during
+the store. a source weight multiplies the total, so logs can count
+double and old notes half, and --trace shows the weight in the srcw
+column. novelty is not a static factor, it is applied during
 selection as an mmr penalty against chunks already picked, so the block
 does not fill up with five versions of the same paragraph. near-dupes
 above 0.8 shingle jaccard get dropped before selection even starts.
