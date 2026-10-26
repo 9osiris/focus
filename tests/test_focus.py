@@ -121,6 +121,40 @@ class ScoreTests(unittest.TestCase):
         w2 = scoremod.parse_weights("bogus=9")
         self.assertEqual(w2, scoremod.DEFAULT_WEIGHTS)
 
+    def test_parse_source_weights(self):
+        sw = scoremod.parse_source_weights("chat.jsonl=2.0,notes=0.5")
+        self.assertEqual(sw, [("chat.jsonl", 2.0), ("notes", 0.5)])
+        self.assertEqual(scoremod.parse_source_weights(""), [])
+        self.assertEqual(scoremod.parse_source_weights(None), [])
+        # garbage parts are skipped, negatives clamp to 0
+        sw2 = scoremod.parse_source_weights("bogus,nope=x,logs=-1,docs=0")
+        self.assertEqual(sw2, [("logs", 0.0), ("docs", 0.0)])
+
+    def test_source_weight_first_match_wins(self):
+        s = scoremod.Scorer(
+            "q", now=NOW,
+            source_weights=[("chat", 2.0), (".jsonl", 0.5)])
+        hit = mkchunk("x", source="chat.jsonl")
+        self.assertEqual(s.source_weight(hit), 2.0)
+        miss = mkchunk("x", source="notes.md")
+        self.assertEqual(s.source_weight(miss), 1.0)
+        # matching is case-insensitive
+        upper = mkchunk("x", source="CHAT.jsonl")
+        self.assertEqual(s.source_weight(upper), 2.0)
+
+    def test_source_weight_scales_score(self):
+        plain = scoremod.Scorer("hello", now=NOW)
+        boosted = scoremod.Scorer(
+            "hello", now=NOW, source_weights=[("s", 2.0)])
+        c = mkchunk("hello world", mtime=NOW)
+        base = plain.static_score(c)
+        self.assertGreater(base, 0.0)
+        self.assertAlmostEqual(boosted.static_score(c), base * 2.0)
+        muted = scoremod.Scorer(
+            "hello", now=NOW, source_weights=[("s", 0.0)])
+        self.assertEqual(muted.static_score(c), 0.0)
+        self.assertEqual(boosted.factors(c)["source"], 2.0)
+
     def test_frequency_from_store(self):
         with tempfile.TemporaryDirectory() as d:
             st = storemod.Store(os.path.join(d, "s.json"))
@@ -233,6 +267,15 @@ class RenderTests(unittest.TestCase):
         self.assertIn("IN", out)
         self.assertIn("OUT", out)
         self.assertIn("nope", out)
+
+    def test_trace_shows_source_weight(self):
+        a = mkchunk("aaa", source="chat.jsonl")
+        s = scoremod.Scorer("aaa", now=NOW,
+                            source_weights=[("chat", 2.0)])
+        scored = [(a, s.static_score(a), s.factors(a))]
+        out = render_trace(scored, {a.id}, [])
+        self.assertIn("srcw", out)
+        self.assertIn("2.000", out)
 
 
 class StoreTests(unittest.TestCase):
@@ -360,6 +403,33 @@ class CliTests(unittest.TestCase):
         with open(out) as f:
             body = f.read()
         self.assertIn("gateway", body)
+
+    def test_build_source_weight_in_trace(self):
+        import io
+        from contextlib import redirect_stderr
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            rc = cli_main(["build", "retry", "-s", self.corpus,
+                           "-b", "500", "--trace",
+                           "--source-weight", "a.md=2.0"])
+        self.assertEqual(rc, 0)
+        self.assertIn("srcw", buf.getvalue())
+        self.assertIn("2.000", buf.getvalue())
+
+    def test_build_source_weight_zeroes_score(self):
+        import io
+        from contextlib import redirect_stderr
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            rc = cli_main(["build", "retry", "-s", self.corpus,
+                           "-b", "500", "--trace",
+                           "--source-weight", "a.md=0"])
+        self.assertEqual(rc, 0)
+        # a.md is the only chunk matching the query; at weight 0 its
+        # score drops to 0, which the trace shows on its own row
+        rows = [l for l in buf.getvalue().splitlines() if "a.md" in l]
+        self.assertEqual(len(rows), 1)
+        self.assertIn("  0.000   ", rows[0])
 
     def test_build_tokenizer_trace_names_estimate(self):
         import io
