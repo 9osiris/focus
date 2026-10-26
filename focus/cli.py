@@ -6,11 +6,11 @@ import time
 from .budget import compress_tail, dedup, select
 from .chunk import collect
 from .render import render, render_trace
-from .score import Scorer, parse_weights
+from .score import Scorer, parse_source_weights, parse_weights
 from .store import Store
 from .tokens import Tokenizer
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 
 def cmd_build(args):
@@ -27,7 +27,9 @@ def cmd_build(args):
 
     scorer = Scorer(args.query, store=store,
                     weights=parse_weights(args.weights),
-                    half_life_h=args.half_life, now=now)
+                    half_life_h=args.half_life, now=now,
+                    source_weights=parse_source_weights(
+                        args.source_weight))
     scorer.learn_candidates(chunks)
 
     scored = []
@@ -124,6 +126,11 @@ def build_parser():
     b.add_argument("--weights",
                    help="e.g. recency=0.2,relevance=0.5,novelty=0.2,"
                         "frequency=0.1")
+    b.add_argument("--source-weight",
+                   help="e.g. chat.jsonl=2.0,notes=0.5: boost or sink "
+                        "chunks whose source path contains the pattern, "
+                        "first match wins, 0 zeroes the score so the "
+                        "source sinks to the bottom of the pile")
     b.add_argument("--half-life", type=float, default=24.0,
                    help="recency half-life in hours (default 24)")
     b.add_argument("--mmr", type=float, default=0.5,
