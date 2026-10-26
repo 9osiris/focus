@@ -32,14 +32,39 @@ def parse_weights(spec):
     return out
 
 
+def parse_source_weights(spec):
+    # "chat.jsonl=2.0,notes=0.5" -> [(pattern, weight), ...] in order,
+    # first match wins at score time. patterns match as case-insensitive
+    # substrings of the chunk source. garbage parts are skipped,
+    # negative weights clamp to 0 (a source can be sunk to zero, never
+    # boosted by a negative).
+    out = []
+    if not spec:
+        return out
+    for part in spec.split(","):
+        if "=" not in part:
+            continue
+        pat, val = part.split("=", 1)
+        pat = pat.strip().lower()
+        if not pat:
+            continue
+        try:
+            w = float(val)
+        except ValueError:
+            continue
+        out.append((pat, max(0.0, w)))
+    return out
+
+
 class Scorer:
     def __init__(self, query, store=None, weights=None,
-                 half_life_h=24.0, now=None):
+                 half_life_h=24.0, now=None, source_weights=None):
         self.query_terms = words(query)
         self.store = store
         self.weights = dict(weights) if weights else dict(DEFAULT_WEIGHTS)
         self.half_life = max(1e-6, half_life_h)
         self.now = now if now is not None else time.time()
+        self.source_weights = list(source_weights) if source_weights else []
         # idf falls back to the candidate set when no store stats exist
         self._cand_df = {}
         self._cand_n = 0
@@ -95,6 +120,14 @@ class Scorer:
             return 1.0
         return math.log1p(count) / math.log1p(cap)
 
+    def source_weight(self, chunk):
+        # first pattern that appears in the source wins, else neutral
+        src = chunk.source.lower()
+        for pat, w in self.source_weights:
+            if pat in src:
+                return w
+        return 1.0
+
     def factors(self, chunk):
         return {
             "recency": round(self.recency(chunk), 4),
@@ -103,9 +136,11 @@ class Scorer:
             # novelty is computed against the selected set during
             # budget allocation (mmr), so it is not a static factor
             "novelty": None,
+            "source": round(self.source_weight(chunk), 4),
         }
 
     def static_score(self, chunk):
         f = self.factors(chunk)
-        return sum(self.weights[k] * f[k]
+        base = sum(self.weights[k] * f[k]
                    for k in ("recency", "relevance", "frequency"))
+        return base * f["source"]
