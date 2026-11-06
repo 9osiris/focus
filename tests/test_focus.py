@@ -1,0 +1,667 @@
+import json
+import os
+import sys
+import tempfile
+import unittest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from focus import chunk as chunkmod
+from focus import score as scoremod
+from focus import budget as budgetmod
+from focus.render import render, render_trace
+from focus import store as storemod
+from focus.cli import main as cli_main
+
+try:
+    import tiktoken  # noqa: F401
+    HAS_TIKTOKEN = True
+except ImportError:
+    HAS_TIKTOKEN = False
+
+NOW = 1_760_000_000.0
+
+
+def mkchunk(text, mtime=NOW, source="s", pinned=False):
+    return chunkmod.Chunk(source, text, mtime=mtime, pinned=pinned)
+
+
+class ChunkTests(unittest.TestCase):
+    def test_windows_with_overlap(self):
+        text = "\n".join("line %d" % i for i in range(100))
+        chunks = chunkmod.chunk_text("s", text, max_lines=40, overlap=8)
+        self.assertEqual(len(chunks), 3)
+        self.assertIn("line 39", chunks[0].text)
+        self.assertIn("line 32", chunks[1].text)  # overlap region
+        self.assertIn("line 99", chunks[2].text)
+
+    def test_empty_text_no_chunks(self):
+        self.assertEqual(chunkmod.chunk_text("s", "   \n  "), [])
+
+    def test_fingerprint_stable(self):
+        a = mkchunk("hello")
+        b = mkchunk("hello")
+        self.assertEqual(a.id, b.id)
+        c = chunkmod.Chunk("other", "hello")
+        self.assertNotEqual(a.id, c.id)
+
+    def test_tokens_rough(self):
+        self.assertEqual(chunkmod.estimate_tokens("a" * 400), 100)
+
+    def test_snippet(self):
+        c = mkchunk("\n".join("l%d" % i for i in range(10)))
+        self.assertIn("[...]", c.snippet(3))
+        self.assertNotIn("[...]", mkchunk("a\nb").snippet(3))
+
+    def test_jsonl_parsing(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl",
+                                         delete=False) as f:
+            f.write('{"text": "first", "ts": 100}\n')
+            f.write('not json\n')
+            f.write('{"text": "   "}\n')
+            f.write('{"text": "second"}\n')
+            path = f.name
+        try:
+            chunks = chunkmod.chunk_jsonl(path)
+            self.assertEqual(len(chunks), 2)
+            self.assertEqual(chunks[0].text, "first")
+            self.assertEqual(chunks[0].mtime, 100)
+            self.assertEqual(chunks[0].meta["line"], 0)
+        finally:
+            os.unlink(path)
+
+    def test_collect_skips_binary_and_hidden(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "ok.txt"), "w") as f:
+                f.write("hello world\n")
+            with open(os.path.join(d, "bin.dat"), "wb") as f:
+                f.write(b"\x00\x01\x02binary")
+            with open(os.path.join(d, ".hidden"), "w") as f:
+                f.write("secret\n")
+            os.mkdir(os.path.join(d, ".git"))
+            with open(os.path.join(d, ".git", "x"), "w") as f:
+                f.write("nope\n")
+            chunks = chunkmod.collect([d])
+            sources = {c.source for c in chunks}
+            self.assertTrue(any(s.endswith("ok.txt") for s in sources))
+            self.assertFalse(any("bin.dat" in s for s in sources))
+            self.assertFalse(any(".hidden" in s for s in sources))
+            self.assertFalse(any(".git" in s for s in sources))
+
+
+class ScoreTests(unittest.TestCase):
+    def test_recency_newer_wins(self):
+        s = scoremod.Scorer("nothing matching", now=NOW)
+        old = mkchunk("zzz qqq", mtime=NOW - 48 * 3600)
+        new = mkchunk("zzz qqq", mtime=NOW - 1 * 3600)
+        self.assertGreater(s.recency(new), s.recency(old))
+
+    def test_relevance_query_match_wins(self):
+        s = scoremod.Scorer("circuit breaker trips")
+        chunks = [mkchunk("the circuit breaker trips after failures"),
+                  mkchunk("deploy checklist for release day")]
+        s.learn_candidates(chunks)
+        self.assertGreater(s.relevance(chunks[0]), s.relevance(chunks[1]))
+
+    def test_relevance_empty_query_zero(self):
+        s = scoremod.Scorer("")
+        self.assertEqual(s.relevance(mkchunk("anything")), 0.0)
+
+    def test_idf_rare_term_heavier(self):
+        s = scoremod.Scorer("q")
+        s.learn_candidates([mkchunk("alpha beta"), mkchunk("alpha gamma"),
+                            mkchunk("alpha delta")])
+        self.assertGreater(s.idf("beta"), s.idf("alpha"))
+
+    def test_parse_weights(self):
+        w = scoremod.parse_weights("recency=1,relevance=3")
+        # unspecified keys keep their defaults, then it normalizes
+        self.assertAlmostEqual(w["recency"], 1 / 4.3)
+        self.assertAlmostEqual(w["relevance"], 3 / 4.3)
+        w2 = scoremod.parse_weights("bogus=9")
+        self.assertEqual(w2, scoremod.DEFAULT_WEIGHTS)
+
+    def test_parse_source_weights(self):
+        sw = scoremod.parse_source_weights("chat.jsonl=2.0,notes=0.5")
+        self.assertEqual(sw, [("chat.jsonl", 2.0), ("notes", 0.5)])
+        self.assertEqual(scoremod.parse_source_weights(""), [])
+        self.assertEqual(scoremod.parse_source_weights(None), [])
+        # garbage parts are skipped, negatives clamp to 0
+        sw2 = scoremod.parse_source_weights("bogus,nope=x,logs=-1,docs=0")
+        self.assertEqual(sw2, [("logs", 0.0), ("docs", 0.0)])
+
+    def test_source_weight_first_match_wins(self):
+        s = scoremod.Scorer(
+            "q", now=NOW,
+            source_weights=[("chat", 2.0), (".jsonl", 0.5)])
+        hit = mkchunk("x", source="chat.jsonl")
+        self.assertEqual(s.source_weight(hit), 2.0)
+        miss = mkchunk("x", source="notes.md")
+        self.assertEqual(s.source_weight(miss), 1.0)
+        # matching is case-insensitive
+        upper = mkchunk("x", source="CHAT.jsonl")
+        self.assertEqual(s.source_weight(upper), 2.0)
+
+    def test_source_weight_scales_score(self):
+        plain = scoremod.Scorer("hello", now=NOW)
+        boosted = scoremod.Scorer(
+            "hello", now=NOW, source_weights=[("s", 2.0)])
+        c = mkchunk("hello world", mtime=NOW)
+        base = plain.static_score(c)
+        self.assertGreater(base, 0.0)
+        self.assertAlmostEqual(boosted.static_score(c), base * 2.0)
+        muted = scoremod.Scorer(
+            "hello", now=NOW, source_weights=[("s", 0.0)])
+        self.assertEqual(muted.static_score(c), 0.0)
+        self.assertEqual(boosted.factors(c)["source"], 2.0)
+
+    def test_parse_duration(self):
+        p = scoremod.parse_duration
+        self.assertEqual(p("6h"), 6.0)
+        self.assertEqual(p("7d"), 168.0)
+        self.assertEqual(p("48"), 48.0)
+        self.assertEqual(p(" 2.5h "), 2.5)
+        self.assertIsNone(p("0"))
+        self.assertIsNone(p("-1h"))
+        self.assertIsNone(p("bogus"))
+        self.assertIsNone(p(""))
+        self.assertIsNone(p(None))
+
+    def test_parse_half_lives(self):
+        hl = scoremod.parse_half_lives("chat=6h,notes=7d")
+        self.assertEqual(hl, [("chat", 6.0), ("notes", 168.0)])
+        self.assertEqual(scoremod.parse_half_lives(""), [])
+        self.assertEqual(scoremod.parse_half_lives(None), [])
+        # garbage parts are skipped, zero and negative dropped
+        hl2 = scoremod.parse_half_lives("bogus,nope=x,logs=0,docs=-2h")
+        self.assertEqual(hl2, [])
+
+    def test_parse_half_life_arg(self):
+        p = scoremod.parse_half_life_arg
+        self.assertEqual(p("48"), (48.0, []))
+        self.assertEqual(p("6h"), (6.0, []))
+        self.assertEqual(p("chat=6h,notes=7d"),
+                         (24.0, [("chat", 6.0), ("notes", 168.0)]))
+        self.assertEqual(p("default=48,chat=6h"),
+                         (48.0, [("chat", 6.0)]))
+        self.assertEqual(p(None), (24.0, []))
+        self.assertEqual(p("bogus"), (24.0, []))
+
+    def test_half_life_per_source(self):
+        s = scoremod.Scorer("q", now=NOW, half_life_h=24.0,
+                            half_lives=[("chat", 6.0)])
+        # 6h old: chat is exactly one half-life in, notes barely decayed
+        chat = mkchunk("x", mtime=NOW - 6 * 3600, source="chat.jsonl")
+        notes = mkchunk("x", mtime=NOW - 6 * 3600, source="notes.md")
+        self.assertAlmostEqual(s.recency(chat), 0.5)
+        self.assertAlmostEqual(s.recency(notes), 0.5 ** 0.25)
+        self.assertEqual(s.factors(chat)["hl"], 6.0)
+        self.assertEqual(s.factors(notes)["hl"], 24.0)
+
+    def test_half_life_first_match_wins(self):
+        s = scoremod.Scorer(
+            "q", now=NOW,
+            half_lives=[("chat", 6.0), (".jsonl", 168.0)])
+        hit = mkchunk("x", source="chat.jsonl")
+        self.assertEqual(s.half_life_for(hit), 6.0)
+        miss = mkchunk("x", source="notes.md")
+        self.assertEqual(s.half_life_for(miss), 24.0)
+        # matching is case-insensitive
+        upper = mkchunk("x", source="CHAT.jsonl")
+        self.assertEqual(s.half_life_for(upper), 6.0)
+
+    def test_trace_shows_half_life(self):
+        a = mkchunk("aaa", source="chat.jsonl")
+        s = scoremod.Scorer("aaa", now=NOW,
+                            half_lives=[("chat", 6.0)])
+        scored = [(a, s.static_score(a), s.factors(a))]
+        out = render_trace(scored, {a.id}, [])
+        self.assertIn("hl", out)
+        self.assertIn("6.0", out)
+
+    def test_frequency_from_store(self):
+        with tempfile.TemporaryDirectory() as d:
+            st = storemod.Store(os.path.join(d, "s.json"))
+            c = mkchunk("hello world")
+            st.observe([c], NOW)
+            st.observe([c], NOW)
+            s = scoremod.Scorer("q", store=st, now=NOW)
+            self.assertGreater(s.frequency(c), 0.0)
+            fresh = mkchunk("never seen")
+            self.assertEqual(s.frequency(fresh), 0.0)
+
+    def test_static_score_bounded(self):
+        s = scoremod.Scorer("hello", now=NOW)
+        c = mkchunk("hello world", mtime=NOW)
+        v = s.static_score(c)
+        self.assertGreaterEqual(v, 0.0)
+        self.assertLessEqual(v, 1.0)
+
+
+class BudgetTests(unittest.TestCase):
+    def scored(self, texts, scores=None):
+        out = []
+        for i, t in enumerate(texts):
+            c = mkchunk(t)
+            sc = scores[i] if scores else 0.5
+            out.append((c, sc, {"recency": 0, "relevance": 0,
+                                "frequency": 0, "novelty": None}))
+        return out
+
+    def test_dedup_drops_lower_score_dup(self):
+        text = "the gateway retries with backoff and then gives up"
+        kept, dropped = budgetmod.dedup(
+            self.scored([text, text + " indeed"], [0.9, 0.4]))
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(len(dropped), 1)
+        self.assertEqual(kept[0][1], 0.9)
+
+    def test_dedup_keeps_different(self):
+        kept, dropped = budgetmod.dedup(
+            self.scored(["apples are red fruit", "servers run hot at night"]))
+        self.assertEqual(len(kept), 2)
+        self.assertEqual(len(dropped), 0)
+
+    def test_select_respects_budget(self):
+        texts = ["chunk number %d with some filler words" % i
+                 for i in range(10)]
+        scored = self.scored(texts, [0.1 * i for i in range(10)])
+        selected, excluded = budgetmod.select(scored, 60)
+        used = sum(c.tokens for c, _, _, _ in selected)
+        self.assertLessEqual(used, 60)
+        self.assertTrue(len(excluded) > 0)
+
+    def test_select_prefers_density(self):
+        short = mkchunk("x" * 40)     # 10 tokens
+        long_ = mkchunk("x" * 4000)   # 1000 tokens
+        scored = [(short, 0.5, {}), (long_, 0.9, {})]
+        selected, _ = budgetmod.select(scored, 100)
+        ids = [c.id for c, _, _, _ in selected]
+        self.assertIn(short.id, ids)
+        self.assertNotIn(long_.id, ids)
+
+    def test_pins_go_first(self):
+        texts = ["filler words here " * 20 for _ in range(5)]
+        scored = self.scored(texts, [0.9, 0.8, 0.7, 0.6, 0.5])
+        scored[4][0].pinned = True
+        selected, _ = budgetmod.select(scored, 10_000)
+        self.assertEqual(selected[0][3], "pinned")
+        self.assertTrue(scored[4][0].id == selected[0][0].id)
+
+    def test_mmr_penalizes_similar(self):
+        a = "the cat sat on the mat today"
+        b = "the cat sat on the mat today indeed"
+        c = "quantum routers need jittered backoff logic"
+        scored = self.scored([a, b, c], [0.9, 0.89, 0.5])
+        selected, _ = budgetmod.select(scored, 10_000, mmr_lambda=0.9)
+        texts = [ch.text for ch, _, _, _ in selected]
+        # a and b are near-identical; with strong mmr only one survives
+        # before the unrelated chunk gets picked... both may still fit,
+        # but c must be selected and a picked before b
+        self.assertIn(c, texts)
+        self.assertIn(a, texts)
+
+    def test_compress_tail_shrinks(self):
+        big = mkchunk("\n".join("line %d" % i for i in range(50)))
+        scored = [(big, 0.5, {})]
+        selected, excluded = budgetmod.select(scored, 10_000)
+        selected[0][0].pinned = True
+        selected, notes = budgetmod.compress_tail(selected, 10)
+        self.assertLessEqual(selected[0][0].tokens, 10)
+        self.assertTrue(any("truncated" in n for n in notes))
+        self.assertTrue(any("pinned" in n for n in notes))
+
+
+class RenderTests(unittest.TestCase):
+    def test_render_has_headers(self):
+        c = mkchunk("hello world", source="notes.md")
+        out = render([(c, 0.8, {}, "score 0.800")])
+        self.assertIn("## notes.md", out)
+        self.assertIn("hello world", out)
+        self.assertIn("0.800", out)
+
+    def test_trace_marks_in_out(self):
+        a = mkchunk("aaa", source="a")
+        b = mkchunk("bbb", source="b")
+        scored = [(a, 0.9, {"recency": 1, "relevance": 1, "frequency": 0,
+                            "novelty": None}),
+                  (b, 0.1, {"recency": 0, "relevance": 0, "frequency": 0,
+                            "novelty": None})]
+        out = render_trace(scored, {a.id}, [(b, 0.1, {}, "nope")])
+        self.assertIn("IN", out)
+        self.assertIn("OUT", out)
+        self.assertIn("nope", out)
+
+    def test_trace_shows_source_weight(self):
+        a = mkchunk("aaa", source="chat.jsonl")
+        s = scoremod.Scorer("aaa", now=NOW,
+                            source_weights=[("chat", 2.0)])
+        scored = [(a, s.static_score(a), s.factors(a))]
+        out = render_trace(scored, {a.id}, [])
+        self.assertIn("srcw", out)
+        self.assertIn("2.000", out)
+
+
+class StoreTests(unittest.TestCase):
+    def test_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "s.json")
+            st = storemod.Store(p)
+            c = mkchunk("hello world")
+            st.observe([c], NOW)
+            st.pin(c.id)
+            st.save()
+            st2 = storemod.Store(p)
+            self.assertEqual(st2.seen_count(c.id), 1)
+            self.assertIn(c.id, st2.pins)
+            self.assertGreater(st2.df.get("hello", 0), 0)
+
+    def test_reobserve_no_df_inflation(self):
+        with tempfile.TemporaryDirectory() as d:
+            st = storemod.Store(os.path.join(d, "s.json"))
+            c = mkchunk("hello world")
+            st.observe([c], NOW)
+            st.observe([c], NOW)
+            st.observe([c], NOW)
+            self.assertEqual(st.docs, 1)
+            self.assertEqual(st.df.get("hello"), 1)
+            self.assertEqual(st.seen_count(c.id), 3)
+
+    def test_corrupt_store_tolerated(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "s.json")
+            with open(p, "w") as f:
+                f.write("{not json")
+            st = storemod.Store(p)
+            self.assertEqual(st.stats()["chunks_seen"], 0)
+
+    def test_unpin(self):
+        with tempfile.TemporaryDirectory() as d:
+            st = storemod.Store(os.path.join(d, "s.json"))
+            self.assertTrue(st.pin("abc"))
+            self.assertFalse(st.pin("abc"))
+            self.assertTrue(st.unpin("abc"))
+            self.assertFalse(st.unpin("abc"))
+
+
+class CliTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = os.path.join(self.tmp.name, "focushome")
+        self.old = os.environ.get("FOCUS_HOME")
+        os.environ["FOCUS_HOME"] = self.home
+        self.corpus = os.path.join(self.tmp.name, "corpus")
+        os.mkdir(self.corpus)
+        with open(os.path.join(self.corpus, "a.md"), "w") as f:
+            f.write("# retry logic\n\nthe gateway retries 429s with "
+                    "jittered backoff, three attempts max.\n")
+        with open(os.path.join(self.corpus, "b.md"), "w") as f:
+            f.write("# lunch\n\n" + "had a sandwich. it was fine. " * 60)
+
+    def tearDown(self):
+        if self.old is None:
+            os.environ.pop("FOCUS_HOME", None)
+        else:
+            os.environ["FOCUS_HOME"] = self.old
+        self.tmp.cleanup()
+
+    def test_build_end_to_end(self):
+        rc = cli_main(["build", "retry backoff gateway",
+                       "-s", self.corpus, "-b", "500"])
+        self.assertEqual(rc, 0)
+        st = storemod.Store(os.path.join(self.home, "store.json"))
+        self.assertGreater(st.stats()["chunks_seen"], 0)
+
+    def test_build_out_file(self):
+        out = os.path.join(self.tmp.name, "ctx.md")
+        rc = cli_main(["build", "retry", "-s", self.corpus,
+                       "--out", out, "-b", "100"])
+        self.assertEqual(rc, 0)
+        with open(out) as f:
+            body = f.read()
+        self.assertIn("gateway", body)
+        self.assertNotIn("sandwich", body)
+
+    def test_build_no_sources_found(self):
+        rc = cli_main(["build", "q", "-s",
+                       os.path.join(self.tmp.name, "nope")])
+        self.assertEqual(rc, 1)
+
+    def test_index_and_stats(self):
+        self.assertEqual(cli_main(["index", "-s", self.corpus]), 0)
+        self.assertEqual(cli_main(["stats"]), 0)
+
+    def test_pin_unpin(self):
+        self.assertEqual(cli_main(["pin", "abc123"]), 0)
+        self.assertEqual(cli_main(["unpin", "abc123"]), 0)
+
+    def test_pinned_chunk_always_included(self):
+        cli_main(["index", "-s", self.corpus])
+        st = storemod.Store(os.path.join(self.home, "store.json"))
+        target = None
+        for fp in st.seen:
+            target = fp
+            break
+        cli_main(["pin", target])
+        out = os.path.join(self.tmp.name, "ctx2.md")
+        # tiny budget that would normally drop everything
+        cli_main(["build", "zzzzqqqq", "-s", self.corpus,
+                  "--out", out, "-b", "40"])
+        with open(out) as f:
+            body = f.read()
+        self.assertIn("##", body)  # pinned chunk forced its way in
+
+    @unittest.skipUnless(HAS_TIKTOKEN, "tiktoken not installed")
+    def test_build_with_tokenizer(self):
+        import io
+        from contextlib import redirect_stderr
+        out = os.path.join(self.tmp.name, "ctx3.md")
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            rc = cli_main(["build", "retry", "-s", self.corpus,
+                           "--out", out, "-b", "500",
+                           "--tokenizer", "cl100k_base",
+                           "--trace"])
+        self.assertEqual(rc, 0)
+        self.assertIn("tokenizer: tiktoken cl100k_base", buf.getvalue())
+        with open(out) as f:
+            body = f.read()
+        self.assertIn("gateway", body)
+
+    def test_build_source_weight_in_trace(self):
+        import io
+        from contextlib import redirect_stderr
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            rc = cli_main(["build", "retry", "-s", self.corpus,
+                           "-b", "500", "--trace",
+                           "--source-weight", "a.md=2.0"])
+        self.assertEqual(rc, 0)
+        self.assertIn("srcw", buf.getvalue())
+        self.assertIn("2.000", buf.getvalue())
+
+    def test_build_source_weight_zeroes_score(self):
+        import io
+        from contextlib import redirect_stderr
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            rc = cli_main(["build", "retry", "-s", self.corpus,
+                           "-b", "500", "--trace",
+                           "--source-weight", "a.md=0"])
+        self.assertEqual(rc, 0)
+        # a.md is the only chunk matching the query; at weight 0 its
+        # score drops to 0, which the trace shows on its own row
+        rows = [l for l in buf.getvalue().splitlines() if "a.md" in l]
+        self.assertEqual(len(rows), 1)
+        self.assertIn("  0.000   ", rows[0])
+
+    def test_build_half_life_per_source_in_trace(self):
+        import io
+        from contextlib import redirect_stderr
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            rc = cli_main(["build", "retry", "-s", self.corpus,
+                           "-b", "500", "--trace",
+                           "--half-life", "a.md=1h,default=24h"])
+        self.assertEqual(rc, 0)
+        out = buf.getvalue()
+        self.assertIn("hl", out)
+        rows = [l for l in out.splitlines() if "a.md" in l]
+        self.assertEqual(len(rows), 1)
+        self.assertIn("1.0", rows[0])
+        # b.md falls back to the 24h default
+        brows = [l for l in out.splitlines() if "b.md" in l]
+        self.assertEqual(len(brows), 1)
+        self.assertIn("24.0", brows[0])
+
+    def test_build_half_life_plain_duration(self):
+        import io
+        from contextlib import redirect_stderr
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            rc = cli_main(["build", "retry", "-s", self.corpus,
+                           "-b", "500", "--trace",
+                           "--half-life", "6h"])
+        self.assertEqual(rc, 0)
+        # every row uses the plain 6h default
+        rows = [l for l in buf.getvalue().splitlines()
+                if "a.md" in l or "b.md" in l]
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertIn("6.0", row)
+
+    def test_build_tokenizer_trace_names_estimate(self):
+        import io
+        from contextlib import redirect_stderr
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            rc = cli_main(["build", "retry", "-s", self.corpus,
+                           "-b", "500", "--trace"])
+        self.assertEqual(rc, 0)
+        self.assertIn("tokenizer: estimate (4 chars/token)",
+                      buf.getvalue())
+
+    def test_build_tokenizer_fallback_warns(self):
+        import io
+        from contextlib import redirect_stderr
+        saved = sys.modules.get("tiktoken", "absent")
+        sys.modules["tiktoken"] = None  # makes import tiktoken fail
+        try:
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                rc = cli_main(["build", "retry", "-s", self.corpus,
+                               "-b", "500",
+                               "--tokenizer", "cl100k_base"])
+            self.assertEqual(rc, 0)
+            self.assertIn("tiktoken not installed", buf.getvalue())
+        finally:
+            if saved == "absent":
+                sys.modules.pop("tiktoken", None)
+            else:
+                sys.modules["tiktoken"] = saved
+
+
+class StubTok:
+    # 1 token per char, deliberately unlike the 4-char estimate
+    exact = False
+
+    def count(self, text):
+        return max(1, len(text))
+
+    def describe(self):
+        return "stub (1 char/token)"
+
+
+class TokenizerTests(unittest.TestCase):
+    def test_estimate_still_four_chars(self):
+        from focus import tokens as tokensmod
+        self.assertEqual(tokensmod.estimate_tokens("a" * 400), 100)
+        self.assertEqual(tokensmod.estimate_tokens("abc"), 1)
+
+    def test_default_is_estimate(self):
+        from focus.tokens import Tokenizer
+        tok = Tokenizer()
+        self.assertFalse(tok.exact)
+        self.assertIn("estimate", tok.describe())
+        self.assertEqual(tok.count("a" * 400), 100)
+
+    def test_bad_name_warns_and_falls_back(self):
+        import io
+        from contextlib import redirect_stderr
+        from focus.tokens import Tokenizer
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            tok = Tokenizer("definitely_not_a_real_encoding_xyz")
+        self.assertFalse(tok.exact)
+        self.assertIn("unknown tiktoken encoding", buf.getvalue())
+        self.assertEqual(tok.count("a" * 400), 100)
+
+    def test_missing_tiktoken_warns_and_falls_back(self):
+        import io
+        from contextlib import redirect_stderr
+        from focus.tokens import Tokenizer
+        saved = sys.modules.get("tiktoken", "absent")
+        sys.modules["tiktoken"] = None  # makes import tiktoken fail
+        try:
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                tok = Tokenizer("cl100k_base")
+            self.assertFalse(tok.exact)
+            self.assertIn("tiktoken not installed", buf.getvalue())
+            self.assertEqual(tok.count("a" * 400), 100)
+        finally:
+            if saved == "absent":
+                sys.modules.pop("tiktoken", None)
+            else:
+                sys.modules["tiktoken"] = saved
+
+    @unittest.skipUnless(HAS_TIKTOKEN, "tiktoken not installed")
+    def test_exact_counts(self):
+        import tiktoken
+        from focus.tokens import Tokenizer
+        tok = Tokenizer("cl100k_base")
+        self.assertTrue(tok.exact)
+        self.assertIn("cl100k_base", tok.describe())
+        text = ("the gateway retries 429s with jittered backoff "
+                "and exponential delays")
+        want = len(tiktoken.get_encoding("cl100k_base").encode(text))
+        self.assertEqual(tok.count(text), want)
+        self.assertNotEqual(want, max(1, len(text) // 4))
+
+    @unittest.skipUnless(HAS_TIKTOKEN, "tiktoken not installed")
+    def test_model_name_resolves(self):
+        from focus.tokens import Tokenizer
+        tok = Tokenizer("gpt-4o")
+        self.assertTrue(tok.exact)
+
+    def test_chunk_uses_injected_tokenizer(self):
+        from focus.tokens import Tokenizer
+        stub = StubTok()
+        c = chunkmod.Chunk("s", "hello world foo", tokenizer=stub)
+        self.assertEqual(c.tokens, stub.count("hello world foo"))
+        d = chunkmod.Chunk("s", "hello world foo",
+                           tokenizer=Tokenizer())
+        self.assertEqual(d.tokens, 3)  # estimate path unchanged
+
+    def test_chunk_text_threads_tokenizer(self):
+        chunks = chunkmod.chunk_text("s", "alpha beta gamma",
+                                     tokenizer=StubTok())
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0].tokens, len("alpha beta gamma"))
+
+    def test_compress_tail_uses_tokenizer(self):
+        stub = StubTok()
+        big = chunkmod.Chunk("s", "\n".join("line %d" % i for i in range(50)),
+                             tokenizer=stub)
+        scored = [(big, 0.5, {})]
+        selected, _ = budgetmod.select(scored, 10_000)
+        selected, notes = budgetmod.compress_tail(selected, 5,
+                                                  tokenizer=stub)
+        c = selected[0][0]
+        self.assertEqual(c.tokens, stub.count(c.text))
+        self.assertNotEqual(c.tokens, max(1, len(c.text) // 4))
+        self.assertTrue(any("truncated" in n for n in notes))
+
+
+if __name__ == "__main__":
+    unittest.main()
